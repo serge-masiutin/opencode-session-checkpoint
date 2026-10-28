@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -61,6 +61,34 @@ export class Journal {
     return (raw === undefined ? undefined : parseState(raw)) ?? emptyState(await this.#nextFreeID(sessionID))
   }
 
+  /** Строгое чтение для GUI: ошибка чтения не должна выглядеть как пустая память. */
+  async inspect(sessionID) {
+    const raw = await this.#read(sessionID)
+    if (raw === undefined) return emptyState(1)
+    const state = parseState(raw)
+    if (state === undefined) throw new Error('The journal is invalid. No changes were made.')
+    return state
+  }
+
+  /** Пользовательская правка: проверка версии и запись проходят в одной очереди с инструментами модели. */
+  edit(sessionID, id, expectedRevision, { text, status, clarification }) {
+    return this.#serial(sessionID, async () => {
+      const state = await this.inspect(sessionID)
+      const entry = state.entries.find((candidate) => candidate.id === id)
+      if (entry === undefined) throw new JournalEditError('not_found', 'Entry not found.')
+      if (entry.reverted === true) throw new JournalEditError('read_only', 'Reverted entries are read-only.')
+      if (entryRevision(entry) !== expectedRevision) throw new JournalEditError('conflict', 'This entry changed. Review the current version; your draft has not been saved.')
+      if (text.trim() === '') throw new JournalEditError('invalid_edit', 'Enter a summary.')
+      if (!STATUSES.includes(status)) throw new JournalEditError('invalid_edit', 'Unknown status.')
+      const correction = { id: randomUUID(), at: new Date().toISOString(), text: text.trim(), status, clarification: clarification.trim() }
+      entry.text = correction.text
+      entry.status = status
+      entry.userEdits = [...(entry.userEdits ?? []), correction]
+      await this.#save(sessionID, state)
+      return entry
+    })
+  }
+
   async #read(sessionID) {
     try {
       return await readFile(join(sessionDir(this.root, sessionID), 'intent.json'), 'utf8')
@@ -110,13 +138,19 @@ export class Journal {
   }
 
   /** Сохраняет сообщение пользователя целиком и ставит заготовку. Повтор того же messageID игнорируется. */
-  recordPrompt(sessionID, messageID, text) {
+  recordPrompt(sessionID, messageID, text, revertTo) {
     return this.#mutate(sessionID, async (state) => {
       const existing = state.entries.find((entry) => entry.messageID === messageID)
       if (existing !== undefined) return existing.id
+      // OpenCode вызывает prompt hook до commit staged rewind. Сохраняем его точную границу,
+      // но применяем только когда новое сообщение действительно появится в контексте модели.
+      const boundary = revertTo === undefined ? -1 : state.entries.findIndex((entry) => entry.messageID === revertTo)
+      if (revertTo !== undefined && boundary === -1) await this.onError(`rewind boundary absent from journal session=${sessionID} message=${revertTo}`)
+      const reverts = boundary === -1 ? [] : state.entries.slice(boundary)
+        .filter((entry) => entry.messageID !== undefined && entry.reverted !== true).map((entry) => entry.id)
       const id = `i${state.next++}`
       await writeAtomic(join(sessionDir(this.root, sessionID), 'prompts'), `${id}.md`, text)
-      state.entries.push({ id, text: PENDING, status: 'open', why: [], decided: [], messageID, prompt: `prompts/${id}.md` })
+      state.entries.push({ id, text: PENDING, status: 'open', why: [], decided: [], messageID, prompt: `prompts/${id}.md`, ...(reverts.length === 0 ? {} : { reverts }) })
       return id
     })
   }
@@ -183,19 +217,40 @@ export function pendingIDs(state) {
 /**
  * Сообщения пользователя, которые пропали из контекста между видимыми сообщениями, — откатанные.
  * Записи позже последнего видимого — ещё в очереди. Раньше первого видимого — откатаны, если сжатия не было,
- * иначе их не отличить от ушедших в сводку, и они не трогаются.
+ * иначе их не отличить от ушедших в сводку. Для новых сообщений reverts хранит точную
+ * границу staged rewind: видимость этого сообщения подтверждает commit, независимо от сжатия.
  */
 export function revertedIDs(state, visibleMessageIDs, compacted) {
   const visible = new Set(visibleMessageIDs)
   const positions = state.entries.flatMap((entry, index) => visible.has(entry.messageID) ? [index] : [])
   if (positions.length === 0) return []
-  return state.entries.slice(compacted ? positions[0] : 0, positions.at(-1))
+  const confirmed = state.entries.filter((entry) => visible.has(entry.messageID)).flatMap((entry) => entry.reverts ?? [])
+  const inferred = state.entries.slice(compacted ? positions[0] : 0, positions.at(-1))
     .filter((entry) => entry.messageID !== undefined && !visible.has(entry.messageID) && entry.reverted !== true)
     .map((entry) => entry.id)
+  const ids = new Set([...confirmed, ...inferred])
+  return state.entries.filter((entry) => ids.has(entry.id) && entry.reverted !== true).map((entry) => entry.id)
 }
 
 const REVERTED_WHY = 'Пользователь откатил это сообщение'
 const emptyState = (next) => ({ next, entries: [], notes: [] })
+
+export class JournalEditError extends Error {
+  constructor(code, message) {
+    super(message)
+    this.code = code
+  }
+}
+
+export function entryRevision(entry) {
+  return createHash('sha256').update(JSON.stringify(entry)).digest('hex')
+}
+
+/** Только последняя пользовательская правка каждой записи; откатанные сообщения не дают указаний. */
+export function userCorrections(state) {
+  return state.entries.filter((entry) => entry.reverted !== true && entry.userEdits?.length > 0)
+    .map((entry) => ({ entryID: entry.id, ...entry.userEdits.at(-1) }))
+}
 
 function parseState(raw) {
   let state
@@ -213,6 +268,10 @@ function isEntry(entry) {
   const lines = (value) => Array.isArray(value) && value.every((line) => typeof line === 'string')
   return entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && typeof entry.text === 'string'
     && STATUSES.includes(entry.status) && lines(entry.why) && lines(entry.decided)
+    && (entry.reverts === undefined || (lines(entry.reverts) && entry.reverts.every((id) => /^i\d+$/.test(id))))
+    && (entry.userEdits === undefined || (Array.isArray(entry.userEdits) && entry.userEdits.every((edit) =>
+      edit !== null && typeof edit === 'object' && typeof edit.id === 'string' && typeof edit.at === 'string'
+      && typeof edit.text === 'string' && STATUSES.includes(edit.status) && typeof edit.clarification === 'string')))
 }
 
 /** full — всё; brief — открытые полностью, остальные одной строкой. */
@@ -221,6 +280,8 @@ export function render(state, mode) {
   for (const entry of state.entries) {
     const head = `- [${entry.id}] ${entry.text}${entry.prompt === undefined ? '' : ` → ${entry.prompt}`} — ${entry.status}`
     lines.push(head)
+    const correction = entry.userEdits?.at(-1)
+    if (correction !== undefined) lines.push(`  **User correction:** ${JSON.stringify(correction)}`)
     if (mode === 'brief' && entry.status !== 'open') continue
     for (const why of entry.why) lines.push(`  **why:** ${why}`)
     for (const decided of entry.decided) lines.push(`  **I decided:** ${decided}`)

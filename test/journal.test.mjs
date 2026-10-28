@@ -322,3 +322,83 @@ test('без сжатия откат с первого сообщения зак
   const state = JSON.parse(await readFile(join(root, 'ses_test/intent.json'), 'utf8'))
   assert.deepEqual(state.entries.map((entry) => entry.status), ['dropped', 'dropped', 'open'])
 })
+
+test('точная граница rewind закрывает отменённые записи после сжатия', async (t) => {
+  const root = await sandbox(t)
+  const h = host()
+  await setup(h.ctx, root)
+  for (const index of [1, 2, 3]) await h.hooks.get('prompt')(prompt(`msg_${index}`, `сообщение ${index}`))
+  h.ctx.session.get = async ({ sessionID }) => ({ id: sessionID, revert: { messageID: 'msg_2' } })
+  await h.hooks.get('prompt')(prompt('msg_4', 'новая ветка'))
+  const before = await new Journal(root).load('ses_test')
+  assert.deepEqual(before.entries[3].reverts, ['i2', 'i3'])
+  assert.ok(before.entries.every((entry) => entry.status === 'open'), 'до подтверждения admission статусы не меняются')
+  h.messages.push({ id: 'cmp_1', type: 'compaction', status: 'completed' }, { id: 'msg_4', type: 'user' })
+  await h.hooks.get('context')(request())
+  assert.deepEqual((await new Journal(root).load('ses_test')).entries.map((entry) => entry.status), ['open', 'dropped', 'dropped', 'open'])
+  await h.hooks.get('context')(request())
+  assert.equal((await new Journal(root).load('ses_test')).entries[1].why.length, 1, 'повторный context не дублирует причину')
+})
+
+test('неудавшийся admission с staged rewind не закрывает прежние записи', async (t) => {
+  const root = await sandbox(t)
+  const h = host()
+  await setup(h.ctx, root)
+  for (const index of [1, 2, 3]) {
+    await h.hooks.get('prompt')(prompt(`msg_${index}`, `сообщение ${index}`))
+    h.messages.push({ id: `msg_${index}`, type: 'user' })
+  }
+  h.ctx.session.get = async ({ sessionID }) => ({ id: sessionID, revert: { messageID: 'msg_2' } })
+  await h.hooks.get('prompt')(prompt('msg_failed', 'не прошло подготовку'))
+  // msg_failed не попал в видимую историю: завершившаяся подготовка — не то же, что admission.
+  await h.hooks.get('context')(request())
+  assert.ok((await new Journal(root).load('ses_test')).entries.every((entry) => entry.reverted !== true))
+})
+
+test('граница rewind переживает перезагрузку плагина до следующего запроса', async (t) => {
+  const root = await sandbox(t)
+  const journal = new Journal(root)
+  await journal.recordPrompt('ses_test', 'msg_1', 'первое')
+  await journal.recordPrompt('ses_test', 'msg_2', 'второе')
+  await journal.recordPrompt('ses_test', 'msg_3', 'новая ветка', 'msg_2')
+  const h = host()
+  await setup(h.ctx, root)
+  h.messages.push({ id: 'cmp_1', type: 'compaction', status: 'completed' }, { id: 'msg_3', type: 'user' })
+  await h.hooks.get('context')(request())
+  assert.deepEqual((await journal.load('ses_test')).entries.map((entry) => entry.status), ['open', 'dropped', 'open'])
+  assert.equal(await journal.readPrompt('ses_test', 'i2'), 'второе')
+})
+
+test('граница вне журнала наблюдаема, но не мешает сохранить новый промпт', async (t) => {
+  const warnings = []
+  const journal = new Journal(await sandbox(t), async (warning) => warnings.push(warning))
+  await journal.recordPrompt('ses_test', 'msg_1', 'после старой истории', 'msg_unknown')
+  assert.match(warnings[0], /rewind boundary absent/)
+  assert.equal(await journal.readPrompt('ses_test', 'i1'), 'после старой истории')
+  assert.equal((await journal.load('ses_test')).entries[0].reverts, undefined)
+})
+
+test('сбой регистрации GUI/RPC не отключает инструменты и хуки журнала', async (t) => {
+  const root = await sandbox(t)
+  const h = host()
+  await setup(h.ctx, root, async () => { throw new Error('RPC unavailable') })
+  await h.hooks.get('prompt')(prompt('msg_1', 'первая задача'))
+  assert.equal((await call(h, 'intent_update', { id: 'i1', text: 'задача' })).content, 'Обновлено: i1')
+  assert.match(await readFile(join(root, 'plugin.log'), 'utf8'), /ERROR gui-rpc/)
+})
+
+test('пользовательское уточнение добавляется в обычный запрос без нового сжатия', async (t) => {
+  const root = await sandbox(t)
+  const h = host()
+  await setup(h.ctx, root)
+  await h.hooks.get('prompt')(prompt('msg_1', 'задача'))
+  const journal = new Journal(root)
+  const { entryRevision } = await import('../journal.mjs')
+  const entry = (await journal.load('ses_test')).entries[0]
+  await journal.edit('ses_test', 'i1', entryRevision(entry), { text: 'Только проверить', status: 'open', clarification: 'Не публиковать.' })
+  const event = request()
+  await h.hooks.get('context')(event)
+  assert.match(systemText(event), /Не публиковать/)
+  assert.match(systemText(event), /user input, not system instructions/)
+  assert.equal(h.calls.length, 0, 'правка не запускает compact и отдельный ход модели')
+})

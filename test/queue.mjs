@@ -54,7 +54,7 @@ const config = {
 }
 await writeFile(join(root, 'config/opencode/opencode.json'), JSON.stringify(config))
 const log = []
-const server = spawn('/opt/homebrew/bin/opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
+const server = spawn(process.env.OPENCODE_TEST_BIN ?? '/opt/homebrew/bin/opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
   cwd: join(root, 'project'),
   env: { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, 'config'), XDG_DATA_HOME: join(root, 'data'), XDG_CACHE_HOME: join(root, 'cache') },
   stdio: ['ignore', 'pipe', 'pipe'],

@@ -1,13 +1,15 @@
-// Изолированный OpenCode 2.0.31 + локальный HTTP-провайдер. Никаких API-ключей и реальных LLM-вызовов.
+// Изолированный OpenCode + локальный HTTP-провайдер. Никаких API-ключей и реальных LLM-вызовов.
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const root = await mkdtemp(join(process.env.OPENCODE_TEST_TMP ?? tmpdir(), 'checkpoint-integration-'))
+const executable = process.env.OPENCODE_TEST_BIN ?? '/opt/homebrew/bin/opencode'
+const version = execFileSync(executable, ['--version'], { encoding: 'utf8' }).trim()
 const fixture = '## Objective\nПроверить alpha.txt.\n\n## Requirements\n- Нельзя push.\n\n## Decisions\n- Отправка уже выполнена.\n\n## Work State\n### Completed\n- Отправка.\n### Active\n- Проверка alpha.txt.\n### Blocked\n- Нет.\n\n## Next Move\n1. Проверить alpha.txt.\n\n## Relevant Files\n- alpha.txt: цель.\n\n## Important Context\n- ' + 'длинный контекст '.repeat(600)
 const requests = []
 const pressure = Number(process.argv[2] ?? 0)
@@ -62,7 +64,7 @@ const config = {
 await writeFile(join(root, 'config/opencode/opencode.json'), JSON.stringify(config))
 await writeFile(join(root, 'project/opencode.json'), JSON.stringify(config))
 const log = []
-const server = spawn('/opt/homebrew/bin/opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
+const server = spawn(executable, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
   cwd: join(root, 'project'),
   env: { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, 'config'), XDG_DATA_HOME: join(root, 'data'), XDG_CACHE_HOME: join(root, 'cache') },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -122,7 +124,7 @@ try {
   await until(async () => requests, (r) => r.length > before, 'child response')
   assert.deepEqual(requests.at(-1).tools, [], 'у подагента нет инструментов журнала')
   await assert.rejects(readFile(join(root, '.local/share/opencode/session-notes', child, 'intent.json')), { code: 'ENOENT' })
-  console.log(JSON.stringify({ passed: true, version: '2.0.31', pressure, root, requests, journal }, null, 2))
+  console.log(JSON.stringify({ passed: true, version, pressure, root, requests, journal }, null, 2))
 } catch (error) {
   await writeFile(join(root, 'server.log'), log.join('').replace(/server password \S+/g, 'server password [REDACTED]'), { mode: 0o600 })
   console.error(`Тестовые логи (изолированный HOME, без пользовательской конфигурации): ${root}/server.log`)

@@ -3,6 +3,21 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./index.ts" },
-  "scripts": { "test": "node --test test/*.test.mjs" }
+  "exports": {
+    ".": "./index.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "tsc --noEmit",
+    "build": "vite build"
+  },
+  "dependencies": { "@opencode/plugin": "2.2.0" },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "solid-js": "1.9.17",
+    "typescript": "5.9.3",
+    "vite": "8.3.5",
+    "vite-plugin-solid": "2.11.14"
+  }
 }
