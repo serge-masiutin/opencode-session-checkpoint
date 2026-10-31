@@ -5,7 +5,7 @@ import { join } from 'node:path'
 export const POLICY = Object.freeze({
   // Мягкий порог: сначала напоминание модели, на следующем шаге — штатное сжатие. Ничего не блокируется.
   compactAt: 300_000,
-  retentionDays: 30,
+  retentionDays: 15,
 })
 
 export const STATUSES = Object.freeze(['open', 'done', 'dropped', 'postponed'])
@@ -58,11 +58,16 @@ export class Journal {
   /** Чтение без побочных эффектов; повреждённый журнал читается как пустой, исправляет его только очередь записи. */
   async load(sessionID) {
     const raw = await this.#read(sessionID)
-    return (raw === undefined ? undefined : parseState(raw)) ?? emptyState(await this.#nextFreeID(sessionID))
+    const state = (raw === undefined ? undefined : parseState(raw)) ?? emptyState(await this.#nextFreeID(sessionID))
+    return visibleState(state)
   }
 
   /** Строгое чтение для GUI: ошибка чтения не должна выглядеть как пустая память. */
   async inspect(sessionID) {
+    return visibleState(await this.#inspectAll(sessionID))
+  }
+
+  async #inspectAll(sessionID) {
     const raw = await this.#read(sessionID)
     if (raw === undefined) return emptyState(1)
     const state = parseState(raw)
@@ -73,8 +78,8 @@ export class Journal {
   /** Пользовательская правка: проверка версии и запись проходят в одной очереди с инструментами модели. */
   edit(sessionID, id, expectedRevision, { text, status, clarification }) {
     return this.#serial(sessionID, async () => {
-      const state = await this.inspect(sessionID)
-      const entry = state.entries.find((candidate) => candidate.id === id)
+      const state = await this.#inspectAll(sessionID)
+      const entry = state.entries.find((candidate) => candidate.id === id && candidate.delivered === true)
       if (entry === undefined) throw new JournalEditError('not_found', 'Entry not found.')
       if (entry.reverted === true) throw new JournalEditError('read_only', 'Reverted entries are read-only.')
       if (entryRevision(entry) !== expectedRevision) throw new JournalEditError('conflict', 'This entry changed. Review the current version; your draft has not been saved.')
@@ -84,6 +89,8 @@ export class Journal {
       entry.text = correction.text
       entry.status = status
       entry.userEdits = [...(entry.userEdits ?? []), correction]
+      touchWrite(state)
+      state.usage.userEdits += 1
       await this.#save(sessionID, state)
       return entry
     })
@@ -101,7 +108,7 @@ export class Journal {
   // После потери intent.json нумерация продолжается за уже сохранёнными prompts/iN.md, чтобы их не перезаписать.
   async #nextFreeID(sessionID) {
     try {
-      const numbers = (await readdir(join(sessionDir(this.root, sessionID), 'prompts'))).map((name) => /^i(\d+)\.md$/.exec(name)?.[1]).filter(Boolean).map(Number)
+      const numbers = (await readdir(join(sessionDir(this.root, sessionID), 'prompts'))).map((name) => /^i(\d+)(?:-delivered)?\.md$/.exec(name)?.[1]).filter(Boolean).map(Number)
       return Math.max(0, ...numbers) + 1
     } catch (error) {
       if (error.code === 'ENOENT') return 1
@@ -111,7 +118,7 @@ export class Journal {
 
   async #loadForWrite(sessionID) {
     const raw = await this.#read(sessionID)
-    if (raw === undefined) return emptyState(1)
+    if (raw === undefined) return emptyState(await this.#nextFreeID(sessionID))
     const state = parseState(raw)
     if (state !== undefined) return state
     const path = join(sessionDir(this.root, sessionID), 'intent.json')
@@ -125,7 +132,16 @@ export class Journal {
     const folder = sessionDir(this.root, sessionID)
     await writeAtomic(folder, 'intent.json', `${JSON.stringify(state, null, 2)}\n`)
     // intent.md — только отображение: его сбой не должен превращать сохранённую запись в ошибку для модели.
-    await writeAtomic(folder, 'intent.md', render(state, 'full')).catch((error) => this.onError(`intent.md: ${error.message}`))
+    await writeAtomic(folder, 'intent.md', render(visibleState(state), 'full')).catch((error) => this.onError(`intent.md: ${error.message}`))
+  }
+
+  /** Обновляет доступное модели представление только из подтверждённых записей. */
+  syncView(sessionID) {
+    return this.#serial(sessionID, async () => {
+      if (await this.#read(sessionID) === undefined) return
+      const state = await this.#inspectAll(sessionID)
+      await writeAtomic(sessionDir(this.root, sessionID), 'intent.md', render(visibleState(state), 'full'))
+    })
   }
 
   #mutate(sessionID, change) {
@@ -139,18 +155,21 @@ export class Journal {
 
   /** Сохраняет сообщение пользователя целиком и ставит заготовку. Повтор того же messageID игнорируется. */
   recordPrompt(sessionID, messageID, text, revertTo) {
-    return this.#mutate(sessionID, async (state) => {
-      const existing = state.entries.find((entry) => entry.messageID === messageID)
+    return this.#serial(sessionID, async () => {
+      const state = await this.#loadForWrite(sessionID)
+      const existing = state.entries.find((entry) => entry.delivered === true && entry.messageID === messageID)
       if (existing !== undefined) return existing.id
       // OpenCode вызывает prompt hook до commit staged rewind. Сохраняем его точную границу,
       // но применяем только когда новое сообщение действительно появится в контексте модели.
       const boundary = revertTo === undefined ? -1 : state.entries.findIndex((entry) => entry.messageID === revertTo)
       if (revertTo !== undefined && boundary === -1) await this.onError(`rewind boundary absent from journal session=${sessionID} message=${revertTo}`)
       const reverts = boundary === -1 ? [] : state.entries.slice(boundary)
-        .filter((entry) => entry.messageID !== undefined && entry.reverted !== true).map((entry) => entry.id)
+        .filter((entry) => entry.delivered === true && entry.messageID !== undefined && entry.reverted !== true).map((entry) => entry.id)
       const id = `i${state.next++}`
       await writeAtomic(join(sessionDir(this.root, sessionID), 'prompts'), `${id}.md`, text)
-      state.entries.push({ id, text: PENDING, status: 'open', why: [], decided: [], messageID, prompt: `prompts/${id}.md`, ...(reverts.length === 0 ? {} : { reverts }) })
+      state.entries.push({ id, text: PENDING, status: 'open', why: [], decided: [], messageID, delivered: true, prompt: `prompts/${id}.md`, ...(reverts.length === 0 ? {} : { reverts }) })
+      touchWrite(state)
+      await this.#save(sessionID, state)
       return id
     })
   }
@@ -158,7 +177,8 @@ export class Journal {
   addIntent(sessionID, { text, why, decided }) {
     return this.#mutate(sessionID, (state) => {
       const id = `i${state.next++}`
-      state.entries.push({ id, text, status: 'open', why: why === undefined ? [] : [why], decided: decided === undefined ? [] : [decided] })
+      state.entries.push({ id, text, status: 'open', why: why === undefined ? [] : [why], decided: decided === undefined ? [] : [decided], delivered: true })
+      touchWrite(state)
       return id
     })
   }
@@ -166,7 +186,31 @@ export class Journal {
   addNote(sessionID, kind, text) {
     if (!Object.hasOwn(NOTE_KINDS, kind)) throw new Error(`Неизвестный вид записи: ${kind}; допустимо: intent, ${Object.keys(NOTE_KINDS).join(', ')}`)
     return this.#mutate(sessionID, (state) => {
-      state.notes.push({ kind, text })
+      state.notes.push({ id: randomUUID(), at: new Date().toISOString(), kind, text, delivered: true })
+      touchWrite(state)
+    })
+  }
+
+  /** Удаление заметки уровня сессии из GUI; исходные промпты и выводы агента не трогает. */
+  dismissNote(sessionID, id) {
+    return this.#mutate(sessionID, (state) => {
+      const index = state.notes.findIndex((note) => note.id === id && note.delivered === true)
+      if (index === -1) throw new JournalEditError('not_found', 'Note not found.')
+      state.notes.splice(index, 1)
+      return state.notes.length
+    })
+  }
+
+  /** Фиксирует факт выдачи журнала модели: обычный контекст, восстановление или сводка. */
+  noteServed(sessionID, { restored = false, summarized = false, pressured = false } = {}) {
+    return this.#mutate(sessionID, (state) => {
+      const usage = usageOf(state)
+      usage.served += 1
+      if (restored) usage.restores += 1
+      if (summarized) usage.summaries += 1
+      if (pressured) usage.pressures += 1
+      usage.lastServedAt = new Date().toISOString()
+      state.usage = usage
     })
   }
 
@@ -175,13 +219,14 @@ export class Journal {
     if (status !== undefined && !STATUSES.includes(status)) throw new Error(`Неизвестный статус: ${status}; допустимо: ${STATUSES.join(', ')}`)
     return this.#mutate(sessionID, (state) => {
       const entry = target.id === undefined
-        ? state.entries.find((candidate) => candidate.messageID === target.messageID)
-        : state.entries.find((candidate) => candidate.id === target.id)
-      if (entry === undefined) throw new Error(target.id === undefined ? 'Для сообщения, на которое ты отвечаешь, нет записи; укажи id' : `Запись ${target.id} не найдена; есть: ${state.entries.map((candidate) => candidate.id).join(', ') || 'нет записей'}`)
+        ? state.entries.find((candidate) => candidate.delivered === true && candidate.messageID === target.messageID)
+        : state.entries.find((candidate) => candidate.delivered === true && candidate.id === target.id)
+      if (entry === undefined) throw new Error(target.id === undefined ? 'Для сообщения, на которое ты отвечаешь, нет записи; укажи id' : `Запись ${target.id} не найдена; есть: ${visibleState(state).entries.map((candidate) => candidate.id).join(', ') || 'нет записей'}`)
       if (text !== undefined) entry.text = text
       if (status !== undefined) entry.status = status
       if (why !== undefined) entry.why.push(why)
       if (decided !== undefined) entry.decided.push(decided)
+      touchWrite(state)
       return entry.id
     })
   }
@@ -189,25 +234,35 @@ export class Journal {
   /** Закрывает записи откатанных сообщений. Возвращает их ID. */
   markReverted(sessionID, visibleMessageIDs, compacted) {
     return this.#mutate(sessionID, (state) => {
-      const ids = revertedIDs(state, visibleMessageIDs, compacted)
+      const ids = revertedIDs(visibleState(state), visibleMessageIDs, compacted)
       for (const entry of state.entries.filter((candidate) => ids.includes(candidate.id))) {
         entry.status = 'dropped'
         entry.reverted = true
         entry.why.push(REVERTED_WHY)
       }
+      if (ids.length > 0) touchWrite(state)
       return ids
     })
   }
 
   async readPrompt(sessionID, id) {
     if (!/^i\d+$/.test(id)) throw new Error(`Некорректный ID записи: ${id}`)
+    const state = await this.inspect(sessionID)
+    const entry = state.entries.find((candidate) => candidate.id === id && candidate.prompt !== undefined)
+    if (entry === undefined) throw new Error(`У записи ${id} нет доступного сообщения`)
+    if (entry.prompt !== `prompts/${id}.md`) throw new Error(`Некорректный путь сообщения записи ${id}`)
     try {
-      return await readFile(join(sessionDir(this.root, sessionID), 'prompts', `${id}.md`), 'utf8')
+      return await readFile(join(sessionDir(this.root, sessionID), entry.prompt), 'utf8')
     } catch (error) {
       if (error.code === 'ENOENT') throw new Error(`У записи ${id} нет сохранённого сообщения`, { cause: error })
       throw error
     }
   }
+}
+
+// Старые записи без подтверждения могут относиться к недоставленной очереди.
+function visibleState(state) {
+  return { ...state, entries: state.entries.filter((entry) => entry.delivered === true), notes: state.notes.filter((note) => note.delivered === true) }
 }
 
 export function pendingIDs(state) {
@@ -233,7 +288,20 @@ export function revertedIDs(state, visibleMessageIDs, compacted) {
 }
 
 const REVERTED_WHY = 'Пользователь откатил это сообщение'
-const emptyState = (next) => ({ next, entries: [], notes: [] })
+const emptyState = (next) => ({ next, entries: [], notes: [], usage: emptyUsage() })
+const emptyUsage = () => ({ writes: 0, served: 0, restores: 0, summaries: 0, pressures: 0, userEdits: 0, lastWriteAt: null, lastServedAt: null })
+function touchWrite(state) {
+  const usage = usageOf(state)
+  usage.writes += 1
+  usage.lastWriteAt = new Date().toISOString()
+  state.usage = usage
+}
+
+/** Счётчики использования журнала агентом; отсутствуют в старых файлах — считаются нулями. */
+export function usageOf(state) {
+  const usage = state.usage ?? {}
+  return { ...emptyUsage(), ...usage }
+}
 
 export class JournalEditError extends Error {
   constructor(code, message) {
@@ -252,6 +320,12 @@ export function userCorrections(state) {
     .map((entry) => ({ entryID: entry.id, ...entry.userEdits.at(-1) }))
 }
 
+function isNote(note) {
+  return note !== null && typeof note === 'object' && Object.hasOwn(NOTE_KINDS, note?.kind) && typeof note.text === 'string'
+    && (note.id === undefined || typeof note.id === 'string') && (note.at === undefined || typeof note.at === 'string')
+    && (note.delivered === undefined || typeof note.delivered === 'boolean')
+}
+
 function parseState(raw) {
   let state
   try {
@@ -260,14 +334,18 @@ function parseState(raw) {
     return undefined
   }
   const valid = state !== null && typeof state === 'object' && Number.isInteger(state.next) && Array.isArray(state.entries) && Array.isArray(state.notes)
-    && state.entries.every(isEntry) && state.notes.every((note) => Object.hasOwn(NOTE_KINDS, note?.kind) && typeof note.text === 'string')
-  return valid ? state : undefined
+    && state.entries.every(isEntry) && state.notes.every(isNote)
+    && (state.usage === undefined || (state.usage !== null && typeof state.usage === 'object'))
+  if (!valid) return undefined
+  state.usage = usageOf(state)
+  return state
 }
 
 function isEntry(entry) {
   const lines = (value) => Array.isArray(value) && value.every((line) => typeof line === 'string')
-  return entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && typeof entry.text === 'string'
+  return entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && /^i\d+$/.test(entry.id) && typeof entry.text === 'string'
     && STATUSES.includes(entry.status) && lines(entry.why) && lines(entry.decided)
+    && (entry.delivered === undefined || typeof entry.delivered === 'boolean')
     && (entry.reverts === undefined || (lines(entry.reverts) && entry.reverts.every((id) => /^i\d+$/.test(id))))
     && (entry.userEdits === undefined || (Array.isArray(entry.userEdits) && entry.userEdits.every((edit) =>
       edit !== null && typeof edit === 'object' && typeof edit.id === 'string' && typeof edit.at === 'string'
@@ -281,7 +359,7 @@ export function render(state, mode) {
     const head = `- [${entry.id}] ${entry.text}${entry.prompt === undefined ? '' : ` → ${entry.prompt}`} — ${entry.status}`
     lines.push(head)
     const correction = entry.userEdits?.at(-1)
-    if (correction !== undefined) lines.push(`  **User correction:** ${JSON.stringify(correction)}`)
+    if (correction !== undefined && entry.reverted !== true) lines.push(`  **User correction:** ${JSON.stringify(correction)}`)
     if (mode === 'brief' && entry.status !== 'open') continue
     for (const why of entry.why) lines.push(`  **why:** ${why}`)
     for (const decided of entry.decided) lines.push(`  **I decided:** ${decided}`)
@@ -306,7 +384,7 @@ export function latestCompaction(messages) {
   return messages.findLast((message) => message.type === 'compaction' && message.status === 'completed')
 }
 
-/** Удаляет каталоги сессий без изменений дольше срока хранения. Возвращает удалённые ID. */
+/** Удаляет каталоги сессий без изменений не менее срока хранения. Возвращает удалённые ID. */
 export async function pruneOld(root, now = Date.now()) {
   const limit = now - POLICY.retentionDays * 24 * 60 * 60 * 1000
   let names
@@ -321,7 +399,7 @@ export async function pruneOld(root, now = Date.now()) {
     const folder = join(root, name)
     try {
       const info = await stat(folder)
-      if (!info.isDirectory() || info.mtimeMs >= limit) continue
+      if (!info.isDirectory() || info.mtimeMs > limit) continue
       await rm(folder, { recursive: true, force: true })
       removed.push(name)
     } catch (error) {

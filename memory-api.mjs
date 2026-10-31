@@ -1,4 +1,4 @@
-import { entryRevision } from './journal.mjs'
+import { entryRevision, usageOf } from './journal.mjs'
 
 export function presentEntry(entry) {
   return {
@@ -7,6 +7,10 @@ export function presentEntry(entry) {
     hasPrompt: entry.prompt !== undefined, reverted: entry.reverted === true,
     edits: entry.userEdits ?? [], revision: entryRevision(entry),
   }
+}
+
+function presentNote(note) {
+  return { id: note.id, at: note.at, kind: note.kind, text: note.text }
 }
 
 /** RPC читает и пишет через тот же Journal, что и инструменты модели. */
@@ -28,7 +32,7 @@ export function memoryApi(journal) {
       entries.sort((a, b) => Number(b.status === 'open') - Number(a.status === 'open'))
       return {
         entries,
-        notes: state.notes.filter((note) => note.text.toLowerCase().includes(needle)),
+        notes: state.notes.map(presentNote).filter((note) => note.text.toLowerCase().includes(needle)),
         counts: {
           open: state.entries.filter((entry) => entry.status === 'open').length,
           all: state.entries.length,
@@ -43,6 +47,24 @@ export function memoryApi(journal) {
     },
     async edit({ sessionID, id, revision, ...change }) {
       return presentEntry(await journal.edit(sessionID, id, revision, change))
+    },
+    async dismiss({ sessionID, id }) {
+      await journal.dismissNote(sessionID, id)
+      return { notes: (await journal.inspect(sessionID)).notes.map(presentNote) }
+    },
+    async stats({ sessionID }) {
+      const state = await journal.inspect(sessionID)
+      return {
+        usage: usageOf(state),
+        entries: {
+          open: state.entries.filter((entry) => entry.status === 'open').length,
+          all: state.entries.length,
+          decisions: state.entries.filter((entry) => entry.decided.length > 0).length,
+          pending: state.entries.filter((entry) => entry.status === 'open' && entry.text === '(ждёт сути)').length,
+          reverted: state.entries.filter((entry) => entry.reverted === true).length,
+        },
+        notes: state.notes.length,
+      }
     },
   }
 }

@@ -4,29 +4,39 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 
-const delivery = process.argv[2] ?? 'queue'
+const scenario = process.argv[2] ?? 'queue'
+assert.ok(['queue', 'steer', 'cancel'].includes(scenario))
+const delivery = scenario === 'cancel' ? 'queue' : scenario
 const root = await mkdtemp(join(process.env.OPENCODE_TEST_TMP ?? tmpdir(), 'intent-queue-'))
 const requests = []
+let releaseFirst
+const firstGate = new Promise((resolve) => { releaseFirst = resolve })
 const provider = createServer(async (req, res) => {
   let body = ''
   for await (const chunk of req) body += chunk
   const input = JSON.parse(body)
   const userTexts = input.messages.filter((message) => message.role === 'user').map((message) => JSON.stringify(message.content))
   const firstTurn = !input.messages.some((message) => message.role === 'tool') && userTexts.some((text) => text.includes('ПЕРВОЕ')) && !userTexts.some((text) => text.includes('ВТОРОЕ'))
-  requests.push({ firstTurn, users: userTexts.length })
+  const deliveredSecond = userTexts.some((text) => text.includes('ВТОРОЕ'))
+  const guidance = JSON.stringify(input.messages.filter((message) => message.role === 'system'))
+  requests.push({ firstTurn, users: userTexts.length, deliveredSecond, leakedGuidance: !deliveredSecond && /без сути в журнале:.*i2|ВТОРОЕ/.test(guidance) })
   res.writeHead(200, { 'Content-Type': 'text/event-stream' })
   const chunk = (choices, usage) => ({ id: 'chatcmpl-test', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices, ...(usage === undefined ? {} : { usage }) })
   const usage = { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }
   if (firstTurn) {
     // Пока модель «думает», тест отправляет ВТОРОЕ.
-    await delay(3000)
-    const args = JSON.stringify({ text: 'суть первого' })
-    res.write(`data: ${JSON.stringify(chunk([{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'intent_update', arguments: args } }] }, finish_reason: null }]))}\n\n`)
+    await firstGate
+    const calls = [
+      { id: 'call_read', args: { id: 'i2', read_prompt: true } },
+      { id: 'call_write', args: { id: 'i2', text: 'недопустимая правка' } },
+      { id: 'call_current', args: { text: 'суть первого' } },
+    ].map((call, index) => ({ index, id: call.id, type: 'function', function: { name: 'intent_update', arguments: JSON.stringify(call.args) } }))
+    res.write(`data: ${JSON.stringify(chunk([{ index: 0, delta: { role: 'assistant', tool_calls: calls }, finish_reason: null }]))}\n\n`)
     res.write(`data: ${JSON.stringify(chunk([{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage))}\n\n`)
   } else {
     res.write(`data: ${JSON.stringify(chunk([{ index: 0, delta: { role: 'assistant', content: 'Ок.' }, finish_reason: null }]))}\n\n`)
@@ -43,7 +53,7 @@ await mkdir(join(root, 'config/opencode'), { recursive: true })
 await mkdir(join(root, 'project'), { recursive: true })
 const config = {
   model: 'fixture/fixture',
-  plugins: [resolve(import.meta.dirname, '..')],
+  plugins: [resolve(process.env.OPENCODE_CHECKPOINT_PLUGIN ?? resolve(import.meta.dirname, '..'))],
   update: 'disable',
   compaction: { auto: false },
   providers: { fixture: {
@@ -61,10 +71,10 @@ const server = spawn(process.env.OPENCODE_TEST_BIN ?? '/opt/homebrew/bin/opencod
 })
 server.stdout.on('data', (chunk) => log.push(String(chunk)))
 server.stderr.on('data', (chunk) => log.push(String(chunk)))
-async function api(path, body) {
+async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   const password = log.join('').match(/server password (\S+)/)?.[1]
   const headers = { 'Content-Type': 'application/json', ...(password === undefined ? {} : { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` }) }
-  const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers, ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }) })
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers, method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
   const text = await response.text()
   if (!response.ok) throw new Error(`API ${path}: ${response.status} ${text.slice(0, 1000)}`)
   return text === '' ? undefined : JSON.parse(text)
@@ -80,26 +90,46 @@ try {
   const journalPath = join(root, '.local/share/opencode/session-notes', id, 'intent.json')
   await api(`/api/session/${id}/prompt`, { text: 'ПЕРВОЕ: сделай A' })
   for (let attempt = 0; attempt < 100 && !requests.some((request) => request.firstTurn); attempt++) await delay(100)
-  await api(`/api/session/${id}/prompt`, { text: 'ВТОРОЕ: сделай B', delivery })
+  const queued = (await api(`/api/session/${id}/prompt`, { text: 'ВТОРОЕ: сделай B', delivery })).data
   const journalWhileRunning = JSON.parse(await readFile(journalPath, 'utf8').catch(() => '{"entries":[]}'))
+  assert.equal(journalWhileRunning.entries.length, 1, 'очередь не должна создавать запись до доставки модели')
+  assert.ok(!JSON.stringify(journalWhileRunning).includes(queued.id), 'ID очереди не должен появляться в журнале')
+  assert.doesNotMatch(JSON.stringify(journalWhileRunning), /ВТОРОЕ/, 'текст очереди не должен появляться в журнале')
+  const journalFolder = join(root, '.local/share/opencode/session-notes', id)
+  assert.deepEqual(await readdir(join(journalFolder, 'prompts')), ['i1.md'], 'очередь не должна создавать файл промпта')
+  assert.doesNotMatch(await readFile(join(journalFolder, 'intent.md'), 'utf8'), /i2|ВТОРОЕ/, 'очередь не должна появляться в журнале')
+  if (scenario === 'cancel') await api(`/api/session/${id}/inbox/${queued.id}`, undefined, 'DELETE')
+  releaseFirst()
   for (let attempt = 0; attempt < 200; attempt++) {
     const messages = (await api(`/api/session/${id}/context`)).data
-    if (messages.filter((message) => message.type === 'idle').length >= 1 && requests.length >= 3) break
+    if (messages.some((message) => message.type === 'idle') && requests.length >= (scenario === 'queue' ? 3 : 2)) break
     await delay(200)
   }
   await delay(1000)
   const journal = JSON.parse(await readFile(journalPath, 'utf8'))
-  const tool = (await api(`/api/session/${id}/context`)).data.flatMap((message) => message.type === 'assistant' ? message.content : []).find((part) => part.type === 'tool')
-  const result = { delivery, prompt2RecordedWhileRunning: journalWhileRunning.entries.length, toolResult: tool?.state, entries: journal.entries.map(({ id, text, messageID }) => ({ id, text, messageID })), requests }
+  const tools = (await api(`/api/session/${id}/context`)).data.flatMap((message) => message.type === 'assistant' ? message.content : []).filter((part) => part.type === 'tool')
+  const result = { scenario, prompt2RecordedWhileRunning: journalWhileRunning.entries.length, toolResults: tools.map((tool) => tool.state), entries: journal.entries.map(({ id, text, messageID }) => ({ id, text, messageID })), requests }
   console.log(JSON.stringify(result, null, 2))
   assert.equal(journal.entries.find((entry) => entry.id === 'i1').text, 'суть первого', 'правка без id попала в запись первого сообщения')
-  assert.equal(journal.entries.find((entry) => entry.id === 'i2').text, '(ждёт сути)', 'второе сообщение не затронуто')
-  console.log(`PASSED (${delivery})`)
+  assert.ok(requests.every((request) => !request.leakedGuidance), 'подсказки не раскрывают второе сообщение до доставки')
+  assert.equal(tools.filter((tool) => tool.state.status === 'error').length, 2, 'чтение и запись недоставленного i2 отклонены')
+  if (scenario === 'cancel') {
+    assert.equal(journal.entries.length, 1, 'отменённая очередь не создаёт запись')
+    assert.deepEqual(await readdir(join(journalFolder, 'prompts')), ['i1.md'])
+    assert.ok(requests.every((request) => !request.deliveredSecond))
+  } else {
+    assert.equal(journal.entries.length, 2, 'доставленное сообщение записано ровно один раз')
+    assert.equal(journal.entries.find((entry) => entry.id === 'i2').text, '(ждёт сути)', 'второе сообщение не затронуто')
+    assert.equal(await readFile(join(journalFolder, 'prompts/i2.md'), 'utf8'), 'ВТОРОЕ: сделай B')
+    assert.ok(requests.some((request) => request.deliveredSecond))
+  }
+  console.log(`PASSED (${scenario})`)
 } catch (error) {
   await writeFile(join(root, 'server.log'), log.join('').replace(/server password \S+/g, 'server password [REDACTED]'), { mode: 0o600 })
   console.error(`Логи: ${root}/server.log`)
   throw error
 } finally {
+  releaseFirst()
   server.kill('SIGTERM')
   await new Promise((done) => provider.close(done))
 }

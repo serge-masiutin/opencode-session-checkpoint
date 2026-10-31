@@ -40,6 +40,17 @@ export async function registerMemory(ctx: Context, journal: Journal, log: (line:
         return entry
       })
     },
+    dismiss: async (input, context) => {
+      return invoke('dismiss', input, context, async () => {
+        const result = await api.dismiss(input)
+        void registration.events.emit('updated', { sessionID: input.sessionID }).catch((error: unknown) =>
+          log(`ERROR memory.notify session=${input.sessionID}: ${error instanceof Error ? error.stack : String(error)}`))
+        return result
+      })
+    },
+    stats: async (input, context) => {
+      return invoke('stats', input, context, () => api.stats(input))
+    },
   })
   return registration
 }

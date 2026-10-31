@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["node", "vite/client"]
   },
-  "include": ["index.ts", "rpc.ts", "src", "gui", "vite.config.ts", "*.mjs"]
+  "include": ["index.ts", "rpc.ts", "memory-rpc.ts", "src", "gui", "test/gui", "vite.config.ts", "*.mjs"]
 }

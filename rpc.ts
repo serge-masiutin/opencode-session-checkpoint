@@ -20,9 +20,30 @@ export interface MemoryEntry {
   edits: UserEdit[]
   revision: string
 }
+export interface MemoryNote {
+  id: string
+  at: string | null
+  kind: 'blocker' | 'dropped' | 'postponed'
+  text: string
+}
+export interface MemoryUsage {
+  writes: number
+  served: number
+  restores: number
+  summaries: number
+  pressures: number
+  userEdits: number
+  lastWriteAt: string | null
+  lastServedAt: string | null
+}
+export interface MemoryStats {
+  usage: MemoryUsage
+  entries: { open: number; all: number; decisions: number; pending: number; reverted: number }
+  notes: number
+}
 export interface MemorySnapshot {
   entries: MemoryEntry[]
-  notes: { kind: 'blocker' | 'dropped' | 'postponed'; text: string }[]
+  notes: MemoryNote[]
   counts: Record<Filter, number>
 }
 export interface EditInput {
@@ -57,6 +78,7 @@ function strictInput<T>(fields: Record<keyof T, (value: unknown) => boolean>) {
 
 const isSessionID = (value: unknown) => typeof value === 'string' && value.length <= 256 && /^ses_[a-zA-Z0-9]+$/.test(value)
 const isEntryID = (value: unknown) => typeof value === 'string' && value.length <= 64 && /^i[0-9]+$/.test(value)
+const isNoteID = (value: unknown) => typeof value === 'string' && value.length >= 1 && value.length <= 256
 const isRevision = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 const isStatus = (value: unknown) => value === 'open' || value === 'done' || value === 'postponed' || value === 'dropped'
 
@@ -70,6 +92,40 @@ const userEdit = {
   type: 'object',
   properties: { id: text, at: text, text, status, clarification: text },
   required: ['id', 'at', 'text', 'status', 'clarification'], additionalProperties: false,
+} as const
+const note = {
+  type: 'object',
+  properties: {
+    id: text, at: { type: ['string', 'null'] },
+    kind: { type: 'string', enum: ['blocker', 'dropped', 'postponed'] }, text,
+  },
+  required: ['id', 'at', 'kind', 'text'], additionalProperties: false,
+} as const
+const usage = {
+  type: 'object',
+  properties: {
+    writes: { type: 'integer' }, served: { type: 'integer' }, restores: { type: 'integer' },
+    summaries: { type: 'integer' }, pressures: { type: 'integer' }, userEdits: { type: 'integer' },
+    lastWriteAt: { type: ['string', 'null'] }, lastServedAt: { type: ['string', 'null'] },
+  },
+  required: ['writes', 'served', 'restores', 'summaries', 'pressures', 'userEdits', 'lastWriteAt', 'lastServedAt'],
+  additionalProperties: false,
+} as const
+const stats = {
+  type: 'object',
+  properties: {
+    usage,
+    entries: {
+      type: 'object',
+      properties: {
+        open: { type: 'integer' }, all: { type: 'integer' }, decisions: { type: 'integer' },
+        pending: { type: 'integer' }, reverted: { type: 'integer' },
+      },
+      required: ['open', 'all', 'decisions', 'pending', 'reverted'], additionalProperties: false,
+    },
+    notes: { type: 'integer' },
+  },
+  required: ['usage', 'entries', 'notes'], additionalProperties: false,
 } as const
 const entry = {
   type: 'object',
@@ -101,12 +157,7 @@ export const Memory = Rpc.define({
       output: {
         type: 'object', properties: {
           entries: { type: 'array', items: entry },
-          notes: {
-            type: 'array', items: {
-              type: 'object', properties: { kind: { type: 'string', enum: ['blocker', 'dropped', 'postponed'] }, text },
-              required: ['kind', 'text'], additionalProperties: false,
-            },
-          },
+          notes: { type: 'array', items: note },
           counts: { type: 'object', properties: { open: { type: 'integer' }, all: { type: 'integer' }, decisions: { type: 'integer' } }, required: ['open', 'all', 'decisions'], additionalProperties: false },
         }, required: ['entries', 'notes', 'counts'], additionalProperties: false,
       }, errors,
@@ -122,6 +173,14 @@ export const Memory = Rpc.define({
         clarification: (value) => typeof value === 'string' && value.length <= 4000,
       }),
       output: entry, errors,
+    },
+    dismiss: {
+      input: strictInput<{ sessionID: string; id: string }>({ sessionID: isSessionID, id: isNoteID }),
+      output: { type: 'object', properties: { notes: { type: 'array', items: note } }, required: ['notes'], additionalProperties: false }, errors,
+    },
+    stats: {
+      input: strictInput<{ sessionID: string }>({ sessionID: isSessionID }),
+      output: stats, errors,
     },
   },
   events: { updated: { schema: { type: 'object', properties: { sessionID }, required: ['sessionID'], additionalProperties: false } } },

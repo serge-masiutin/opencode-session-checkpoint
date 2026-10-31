@@ -13,23 +13,26 @@ const version = execFileSync(executable, ['--version'], { encoding: 'utf8' }).tr
 const fixture = '## Objective\nПроверить alpha.txt.\n\n## Requirements\n- Нельзя push.\n\n## Decisions\n- Отправка уже выполнена.\n\n## Work State\n### Completed\n- Отправка.\n### Active\n- Проверка alpha.txt.\n### Blocked\n- Нет.\n\n## Next Move\n1. Проверить alpha.txt.\n\n## Relevant Files\n- alpha.txt: цель.\n\n## Important Context\n- ' + 'длинный контекст '.repeat(600)
 const requests = []
 const pressure = Number(process.argv[2] ?? 0)
+let childPressure = false
 const provider = createServer(async (req, res) => {
   let body = ''
   for await (const chunk of req) body += chunk
   const input = JSON.parse(body)
   const all = JSON.stringify(input.messages)
-  const summary = all.includes('Журнал намерений пользователя за сессию')
+  const summary = all.includes('<template>') && all.includes('## Objective')
   const pressured = all.includes('Контекст скоро будет сжат') && !all.includes('"role":"tool"')
   requests.push({
     summary, pressured,
     tools: (input.tools ?? []).map((tool) => tool.function.name).filter((name) => name.startsWith('intent_')),
     journalInSummary: summary && all.includes('проверить alpha.txt') && all.includes('без push'),
+    journalInstruction: all.includes('Журнал намерений пользователя') || all.includes('<intent-journal>'),
     restored: all.includes('Контекст был сжат'),
     promptLeak: !summary && all.includes('Запомни: нужно проверить') && all.includes('<intent-journal>'),
   })
   res.writeHead(200, { 'Content-Type': 'text/event-stream' })
   const chunk = (choices, usage) => ({ id: 'chatcmpl-test', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices, ...(usage === undefined ? {} : { usage }) })
-  const inputTokens = requests.length === 1 && pressure > 0 ? pressure : 100
+  const inputTokens = childPressure ? 300_000 : requests.length === 1 && pressure > 0 ? pressure : 100
+  childPressure = false
   const usage = { prompt_tokens: inputTokens, completion_tokens: 20, total_tokens: inputTokens + 20 }
   if (pressured) {
     const args = JSON.stringify({ id: 'i1', text: 'проверить alpha.txt', decided: 'без push' })
@@ -119,10 +122,22 @@ try {
     assert.ok(requests.find((request) => request.summary).journalInSummary, 'запись модели попала в запрос сводки')
   }
   const before = requests.length
+  const summariesBeforeChild = requests.filter((request) => request.summary).length
   const child = (await api('/api/session', { parentID: id, title: 'child', location: { directory: join(root, 'project') } })).data.id
+  childPressure = true
   await api(`/api/session/${child}/prompt`, { text: 'Задача подагенту' })
   await until(async () => requests, (r) => r.length > before, 'child response')
   assert.deepEqual(requests.at(-1).tools, [], 'у подагента нет инструментов журнала')
+  await until(() => api(`/api/session/${child}/context`), (r) => r.data.some((m) => m.type === 'assistant' && m.time.completed !== undefined && m.tokens?.input === 300_000), 'child usage')
+  await api(`/api/session/${child}/prompt`, { text: 'Продолжи задачу.' })
+  const childMessages = await until(() => api(`/api/session/${child}/context`), (r) => r.data.some((m) => m.type === 'compaction' && ['completed', 'failed'].includes(m.status)), 'child compaction')
+  const childCompaction = childMessages.data.findLast((m) => m.type === 'compaction')
+  assert.equal(childCompaction.status, 'completed', JSON.stringify(childCompaction.error))
+  const childSummaries = requests.filter((request) => request.summary).slice(summariesBeforeChild)
+  assert.equal(childSummaries.length, 1, 'одна сводка подагента')
+  assert.deepEqual(childSummaries[0].tools, [], 'в запросе сводки нет инструментов журнала')
+  assert.equal(childSummaries[0].journalInSummary, false, 'в сводке нет пользовательского журнала')
+  assert.ok(requests.slice(before).every((request) => !request.journalInstruction), 'у подагента нет инструкций и содержимого журнала')
   await assert.rejects(readFile(join(root, '.local/share/opencode/session-notes', child, 'intent.json')), { code: 'ENOENT' })
   console.log(JSON.stringify({ passed: true, version, pressure, root, requests, journal }, null, 2))
 } catch (error) {

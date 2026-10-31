@@ -1,11 +1,17 @@
 import { ErrorBoundary, For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
-import type { Context, MountedSession } from '@opencode/plugin/gui'
+import type { Context, MountedSession, IconName } from '@opencode/plugin/gui'
+import { targetScope } from './target-scope.mjs'
 import { Memory } from '../rpc'
-import type { Filter, MemoryEntry, MemorySnapshot, Status } from '../rpc'
+import type { Filter, MemoryEntry, MemoryNote, MemorySnapshot, MemoryStats, Status } from '../rpc'
 
 const statuses: Record<Status, string> = { open: 'Open', done: 'Done', postponed: 'Deferred', dropped: 'Dropped' }
 const filters: Record<Filter, string> = { open: 'Open', all: 'All', decisions: 'Decisions' }
-const noteLabels = { blocker: 'Blocker', dropped: 'Dropped', postponed: 'Deferred' }
+// Заметки уровня сессии — флаги агента о состоянии работы, не намерения пользователя.
+const noteMeta: Record<MemoryNote['kind'], { label: string; icon: IconName; action: string }> = {
+  blocker: { label: 'Blocked', icon: 'circle-ban-sign', action: 'Resolve' },
+  postponed: { label: 'Deferred', icon: 'circle-exclamation', action: 'Clear' },
+  dropped: { label: 'Dropped', icon: 'circle-xmark', action: 'Clear' },
+}
 export interface Draft { id: string; revision: string; text: string; status: Status; clarification: string }
 type Props = { ctx: Context; session: MountedSession; drafts: Map<string, Draft> }
 
@@ -13,14 +19,13 @@ function failureMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Could not access memory. Try again.'
 }
 
+function whenTime(at: string | null): string {
+  if (at === null) return ''
+  return new Date(at).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })
+}
+
 export function MemoryPanel(props: Props) {
-  // Перемонтирование принадлежит полному RPC scope, а не только sessionID: сервер может переподключиться.
-  const scope = createMemo(() => {
-    const session = props.session
-    const location = session.location
-    if (location === undefined || session.pending) return undefined
-    return { key: `${session.key}\n${JSON.stringify(location)}`, id: session.id, location, client: session.server.client }
-  })
+  const scope = targetScope(() => props.session)
   return <div class="checkpoint-memory">
     <ErrorBoundary fallback={(_, reset) => <div role="alert">Could not display memory. <props.ctx.ui.Button onClick={reset}>Retry</props.ctx.ui.Button></div>}>
       <Show when={scope()} keyed fallback={<p role="status">Waiting for session…</p>}>
@@ -50,7 +55,10 @@ function SessionMemory(props: { ctx: Context; target: Target; drafts: Map<string
   const [selected, setSelected] = createSignal<string | undefined>(savedDraft?.id)
   const [draft, setDraft] = createSignal<Draft | undefined>(savedDraft)
   const [notice, setNotice] = createSignal('')
+  const [noteError, setNoteError] = createSignal('')
   const [saving, setSaving] = createSignal(false)
+  const [dismissing, setDismissing] = createSignal('')
+  const [view, setView] = createSignal<'entries' | 'usage'>('entries')
   const lifetime = new AbortController()
   let root!: HTMLDivElement
   let focusFrame: number | undefined
@@ -128,6 +136,23 @@ function SessionMemory(props: { ctx: Context; target: Target; drafts: Map<string
   }
 
   const entry = createMemo(() => snapshot()?.entries.find((candidate) => candidate.id === selected()))
+
+  async function dismiss(noteId: string) {
+    if (dismissing() !== '') return
+    setDismissing(noteId)
+    setNoteError('')
+    try {
+      await rpc.dismiss({ sessionID: target.id, id: noteId }, { location: target.location, signal: lifetime.signal })
+      if (lifetime.signal.aborted) return
+      reload()
+    } catch (cause) {
+      if (lifetime.signal.aborted) return
+      setNoteError(failureMessage(cause))
+    } finally {
+      if (!lifetime.signal.aborted) setDismissing('')
+    }
+  }
+
   function back() {
     const id = selected()
     setSelected(undefined)
@@ -138,62 +163,138 @@ function SessionMemory(props: { ctx: Context; target: Target; drafts: Map<string
     focusFrame = requestAnimationFrame(() => { focusFrame = undefined; action() })
   }
 
-  return <div ref={root} class="checkpoint-body" classList={{ 'has-selection': selected() !== undefined }}>
-    <aside class="checkpoint-list" aria-label="Session memory">
-      <div class="checkpoint-toolbar">
+  return <div ref={root} class="checkpoint-session">
+    <div class="checkpoint-toolbar checkpoint-topbar">
+      <Show when={view() === 'entries'} fallback={<span class="checkpoint-topbar-title">Usage</span>}>
         <ctx.ui.TextInput label="Search entries and prompts" placeholder="Search entries and prompts" type="search"
           value={query()} disabled={draft() !== undefined} onInput={(value) => {
             setQuery(value.slice(0, 256)); setSelected(undefined)
           }} />
-        <ctx.ui.Button size="small" variant="ghost-muted" disabled={loading()} onClick={reload}>Refresh</ctx.ui.Button>
-      </div>
-      <div class="checkpoint-filters" aria-label="Entry filters">
-        <For each={Object.entries(filters) as [Filter, string][]}>{([value, label]) =>
-          <ctx.ui.Button size="small" variant={filter() === value ? 'neutral' : 'ghost-muted'} disabled={draft() !== undefined}
-            onClick={() => { setFilter(value); setSelected(undefined) }}>{label} {snapshot()?.counts[value]}</ctx.ui.Button>
-        }</For>
-      </div>
-      <Show when={loading()}><span class="checkpoint-state" role="status"><ctx.ui.Loader />Loading…</span></Show>
-      <Show when={error()}><div class="checkpoint-error" role="alert">{error()} <ctx.ui.Button onClick={reload}>Retry</ctx.ui.Button></div></Show>
-      <Show when={snapshot()}>{(value) => <>
-        <Show when={value().entries.length > 0} fallback={<Show when={!loading() && !error()}><p class="checkpoint-state">{value().counts.all === 0 ? 'No entries yet' : 'No results'}</p></Show>}>
-          <ol class="checkpoint-entries"><For each={value().entries}>{(item) => <li>
-            <button type="button" class="checkpoint-entry" data-entry={item.id} aria-current={selected() === item.id ? 'true' : undefined}
-              disabled={draft() !== undefined && draft()!.id !== item.id} onClick={() => { setSelected(item.id); setNotice('') }}>
-              <span class="checkpoint-dot" data-status={item.status} />
-              <span><span class="checkpoint-title">{item.text}</span><span class="checkpoint-meta">{item.id} · {statuses[item.status]}{item.reverted ? ' · Reverted' : ''}{item.edits.length > 0 ? ' · Edited' : ''}</span></span>
-            </button>
-          </li>}</For></ol>
-        </Show>
-        <Show when={value().notes.length > 0}><section class="checkpoint-notes" aria-label="Notes"><For each={value().notes}>{(note) => <p><strong>{noteLabels[note.kind]}</strong> {note.text}</p>}</For></section></Show>
-      </>}</Show>
-    </aside>
-    <main class="checkpoint-detail">
-      <Show when={selected()} fallback={<p class="checkpoint-state">Select an entry</p>}>
-        <ctx.ui.Button size="small" variant="ghost-muted" disabled={draft() !== undefined} onClick={back}>Back to entries</ctx.ui.Button>
-        <Show when={entry()} fallback={<p role="status">{loading() ? 'Loading…' : 'Entry not in this view. Refresh or cancel your edit.'}</p>}>{(current) => <>
-          <EntryDetails ctx={ctx} entry={current()} target={target} />
-          <Show when={current().reverted}><p class="checkpoint-meta">Reverted message · Read-only</p></Show>
-          <Show when={!current().reverted && draft() === undefined}><ctx.ui.Button icon="edit" onClick={() => edit(current())}>Edit</ctx.ui.Button></Show>
-        </>}</Show>
-        <Show when={draft()}>{(change) => <form class="checkpoint-form" onSubmit={(event) => { event.preventDefault(); void save() }}>
-          <h3>Edit entry</h3>
-          <label>Summary<textarea rows="3" required maxLength={1000} disabled={saving()} value={change().text}
-            ref={(element) => onMount(() => element.focus())} onInput={(event) => updateDraft({ text: event.currentTarget.value })} /></label>
-          <div><span class="checkpoint-label">Status</span><ctx.ui.Menu label={statuses[change().status]} trigger="button" placement="bottom-start" disabled={saving()}
-            items={(Object.keys(statuses) as Status[]).map((status) => ({ label: statuses[status], icon: status === change().status ? 'check' : undefined, onSelect: () => updateDraft({ status }) }))} /></div>
-          <label>Clarification (optional)<textarea rows="3" maxLength={4000} disabled={saving()} value={change().clarification} onInput={(event) => updateDraft({ clarification: event.currentTarget.value })} /></label>
-          <Show when={entry() && entry()!.revision !== change().revision}>
-            <div class="checkpoint-error" role="alert"><p>This entry changed. Review the current summary and status before saving.</p>
-              <ctx.ui.Button disabled={saving() || entry()!.reverted} onClick={() => updateDraft({ revision: entry()!.revision })}>Use current version</ctx.ui.Button>
-            </div>
-          </Show>
-          <div class="checkpoint-actions"><ctx.ui.Button disabled={saving()} onClick={cancel}>Cancel</ctx.ui.Button>
-            <ctx.ui.Button type="submit" variant="contrast" busy={saving()} disabled={!entry() || entry()!.reverted || entry()!.revision !== change().revision || change().text.trim() === '' || (change().text.trim() === entry()!.text && change().status === entry()!.status && change().clarification.trim() === '')}>Save</ctx.ui.Button></div>
-        </form>}</Show>
-        <Show when={notice()}><p role="status" class="checkpoint-notice">{notice()}</p></Show>
       </Show>
-    </main>
+      <ctx.ui.Button size="small" variant="ghost-muted" icon={view() !== 'entries' ? 'arrow-left' : 'window-analytics'}
+        onClick={() => setView(view() !== 'entries' ? 'entries' : 'usage')}>
+        {view() !== 'entries' ? 'Back' : 'Usage'}
+      </ctx.ui.Button>
+      <ctx.ui.Button size="small" variant="ghost-muted" disabled={loading()} onClick={reload}>Refresh</ctx.ui.Button>
+    </div>
+    <Show when={view() !== 'entries'} fallback={
+      <div class="checkpoint-body" classList={{ 'has-selection': selected() !== undefined }}>
+        <aside class="checkpoint-list" aria-label="Session memory">
+          <div class="checkpoint-filters" aria-label="Entry filters">
+            <For each={Object.entries(filters) as [Filter, string][]}>{([value, label]) =>
+              <ctx.ui.Button size="small" variant={filter() === value ? 'neutral' : 'ghost-muted'} disabled={draft() !== undefined}
+                onClick={() => { setFilter(value); setSelected(undefined) }}>{label} {snapshot()?.counts[value]}</ctx.ui.Button>
+            }</For>
+          </div>
+          <Show when={loading()}><span class="checkpoint-state" role="status"><ctx.ui.Loader />Loading…</span></Show>
+          <Show when={error()}><div class="checkpoint-error" role="alert">{error()} <ctx.ui.Button onClick={reload}>Retry</ctx.ui.Button></div></Show>
+          <Show when={snapshot()}>{(value) => <>
+            <Show when={value().entries.length > 0} fallback={<Show when={!loading() && !error()}><p class="checkpoint-state">{value().counts.all === 0 ? 'No entries yet' : 'No results'}</p></Show>}>
+              <ol class="checkpoint-entries"><For each={value().entries}>{(item) => <li>
+                <button type="button" class="checkpoint-entry" data-entry={item.id} aria-current={selected() === item.id ? 'true' : undefined}
+                  disabled={draft() !== undefined && draft()!.id !== item.id} onClick={() => { setSelected(item.id); setNotice('') }}>
+                  <span class="checkpoint-dot" data-status={item.status} title={statuses[item.status]} />
+                  <span class="checkpoint-entry-body"><span class="checkpoint-title">{item.text}</span>
+                    <span class="checkpoint-meta">{item.id} · {statuses[item.status]}{item.reverted ? ' · Reverted' : ''}{item.edits.length > 0 ? ' · Edited by you' : ''}</span></span>
+                </button>
+              </li>}</For></ol>
+            </Show>
+            <Show when={noteError()}><div class="checkpoint-error" role="alert">{noteError()}</div></Show>
+            <Show when={value().notes.length > 0}><section class="checkpoint-flags" aria-label="Session flags">
+              <ul class="checkpoint-flags-list">
+                <For each={value().notes}>{(note) => {
+                  const meta = noteMeta[note.kind]
+                  return <li class="checkpoint-flag" data-kind={note.kind}>
+                    <span class="checkpoint-flag-icon"><ctx.ui.Icon name={meta.icon} size="small" /></span>
+                    <div class="checkpoint-flag-body">
+                      <span class="checkpoint-flag-head">
+                        <span class="checkpoint-flag-label">{meta.label}</span>
+                        <span class="checkpoint-flag-time">{whenTime(note.at)}</span>
+                      </span>
+                      <p class="checkpoint-flag-text">{note.text}</p>
+                    </div>
+                    <ctx.ui.Button size="small" variant="ghost-muted" busy={dismissing() === note.id} onClick={() => void dismiss(note.id)}>{meta.action}</ctx.ui.Button>
+                  </li>
+                }}</For>
+              </ul>
+            </section></Show>
+          </>}</Show>
+        </aside>
+        <main class="checkpoint-detail">
+          <Show when={selected()} fallback={<p class="checkpoint-state">Select an entry</p>}>
+            <ctx.ui.Button size="small" variant="ghost-muted" disabled={draft() !== undefined} onClick={back}>Back to entries</ctx.ui.Button>
+            <Show when={entry()} fallback={<p role="status">{loading() ? 'Loading…' : 'Entry not in this view. Refresh or cancel your edit.'}</p>}>{(current) => <>
+              <EntryDetails ctx={ctx} entry={current()} target={target} />
+              <Show when={current().reverted}><p class="checkpoint-meta">Reverted message · Read-only</p></Show>
+              <Show when={!current().reverted && draft() === undefined}><ctx.ui.Button icon="edit" onClick={() => edit(current())}>Edit</ctx.ui.Button></Show>
+            </>}</Show>
+            <Show when={draft()}>{(change) => <form class="checkpoint-form" onSubmit={(event) => { event.preventDefault(); void save() }}>
+              <h3>Edit entry</h3>
+              <label>Summary<textarea rows="3" required maxLength={1000} disabled={saving()} value={change().text}
+                ref={(element) => onMount(() => element.focus())} onInput={(event) => updateDraft({ text: event.currentTarget.value })} /></label>
+              <div><span class="checkpoint-label">Status</span><ctx.ui.Menu label={statuses[change().status]} trigger="button" placement="bottom-start" disabled={saving()}
+                items={(Object.keys(statuses) as Status[]).map((status) => ({ label: statuses[status], icon: status === change().status ? 'check' : undefined, onSelect: () => updateDraft({ status }) }))} /></div>
+              <label>Clarification (optional)<textarea rows="3" maxLength={4000} disabled={saving()} value={change().clarification} onInput={(event) => updateDraft({ clarification: event.currentTarget.value })} /></label>
+              <Show when={entry() && entry()!.revision !== change().revision}>
+                <div class="checkpoint-error" role="alert"><p>This entry changed. Review the current summary and status before saving.</p>
+                  <ctx.ui.Button disabled={saving() || entry()!.reverted} onClick={() => updateDraft({ revision: entry()!.revision })}>Use current version</ctx.ui.Button>
+                </div>
+              </Show>
+              <div class="checkpoint-actions"><ctx.ui.Button disabled={saving()} onClick={cancel}>Cancel</ctx.ui.Button>
+                <ctx.ui.Button type="submit" variant="contrast" busy={saving()} disabled={!entry() || entry()!.reverted || entry()!.revision !== change().revision || change().text.trim() === '' || (change().text.trim() === entry()!.text && change().status === entry()!.status && change().clarification.trim() === '')}>Save</ctx.ui.Button></div>
+            </form>}</Show>
+            <Show when={notice()}><p role="status" class="checkpoint-notice">{notice()}</p></Show>
+          </Show>
+        </main>
+      </div>
+    }>
+      <StatsView ctx={ctx} target={target} refresh={refresh} reload={reload} />
+    </Show>
+  </div>
+}
+
+function StatsView(props: { ctx: Context; target: Target; refresh: () => number; reload: () => void }) {
+  const { ctx } = props
+  const rpc = props.target.client.rpc(Memory)
+  const [stats, setStats] = createSignal<MemoryStats>()
+  const [error, setError] = createSignal('')
+  const [loading, setLoading] = createSignal(false)
+  createEffect(() => {
+    props.refresh()
+    const request = new AbortController()
+    setLoading(true); setError('')
+    void rpc.stats({ sessionID: props.target.id }, { location: props.target.location, signal: request.signal }).then((result) => {
+      if (!request.signal.aborted) setStats(result as MemoryStats)
+    }).catch((cause: unknown) => {
+      if (!request.signal.aborted) setError(failureMessage(cause))
+    }).finally(() => {
+      if (!request.signal.aborted) setLoading(false)
+    })
+    onCleanup(() => request.abort())
+  })
+
+  const when = (at: string | null) => at === null ? 'never' : new Date(at).toLocaleString()
+  return <div class="checkpoint-stats-view">
+    <Show when={loading()}><span class="checkpoint-state" role="status"><ctx.ui.Loader />Loading…</span></Show>
+    <Show when={error()}><div class="checkpoint-error" role="alert">{error()} <ctx.ui.Button onClick={props.reload}>Retry</ctx.ui.Button></div></Show>
+    <Show when={stats()}>{(value) => <>
+      <dl class="checkpoint-stats">
+        <div><dt>Journal writes</dt><dd>{value().usage.writes}</dd></div>
+        <div><dt>Served to model</dt><dd>{value().usage.served}</dd></div>
+        <div><dt>Restores after compaction</dt><dd>{value().usage.restores}</dd></div>
+        <div><dt>Compaction summaries</dt><dd>{value().usage.summaries}</dd></div>
+        <div><dt>Pressure reminders</dt><dd>{value().usage.pressures}</dd></div>
+        <div><dt>Your edits</dt><dd>{value().usage.userEdits}</dd></div>
+        <div><dt>Last write</dt><dd>{when(value().usage.lastWriteAt)}</dd></div>
+        <div><dt>Last served</dt><dd>{when(value().usage.lastServedAt)}</dd></div>
+        <div><dt>Open entries</dt><dd>{value().entries.open}</dd></div>
+        <div><dt>All entries</dt><dd>{value().entries.all}</dd></div>
+        <div><dt>With decisions</dt><dd>{value().entries.decisions}</dd></div>
+        <div><dt>Awaiting summary</dt><dd>{value().entries.pending}</dd></div>
+        <div><dt>Reverted</dt><dd>{value().entries.reverted}</dd></div>
+        <div><dt>Session notes</dt><dd>{value().notes}</dd></div>
+      </dl>
+    </>}</Show>
   </div>
 }
 

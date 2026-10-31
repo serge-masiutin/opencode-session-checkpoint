@@ -6,11 +6,11 @@ const ROOT = join(homedir(), '.local/share/opencode/session-notes')
 const TOOL_NAMES = Object.freeze(['intent_note', 'intent_update'])
 const PENDING_SHOWN = 5
 
-const GUIDANCE = (folder) => `Журнал намерений пользователя: ${folder}/intent.md. Плагин сам ставит заготовку на каждое сообщение пользователя. Ты дописываешь суть (до 20 слов), why и I decided через intent_update, когда пользователь ставит задачу, меняет решение или запрещает что-то; отмечаешь статус по завершении этапа; блокеры, отказы и отложенное пишешь через intent_note. Короткие реплики без нового намерения (да, ок, продолжай) отмечай status=dropped или дополняй ими предыдущую запись. Перед сжатием допиши важное, если оно ещё не записано. Не после каждого действия; команды, вывод инструментов и секреты не записывай.`
-const PENDING_NOTE = (ids, folder) => {
+const GUIDANCE = (folder) => `Журнал намерений пользователя: ${folder}/intent.md. Плагин ставит заготовку только после включения сообщения в запрос модели. Очередь не является активной задачей: не ищи её текст в prompts/, сыром intent.json, inbox API или логах. Исходный текст известной доставленной записи читай через intent_update с id и read_prompt=true; отказ не обходи другим инструментом. Ты дописываешь суть (до 20 слов), why и decided через intent_update, когда пользователь ставит задачу, меняет решение или запрещает что-то; отмечаешь статус по завершении этапа; блокеры, отказы и отложенное пишешь через intent_note. Короткие реплики без нового намерения (да, ок, продолжай) отмечай status=dropped или дополняй ими предыдущую запись. Перед сжатием допиши важное, если оно ещё не записано. Не после каждого действия; команды, вывод инструментов и секреты не записывай.`
+const PENDING_NOTE = (ids) => {
   const shown = ids.slice(-PENDING_SHOWN)
   const more = ids.length - shown.length
-  return `Сообщения пользователя без сути в журнале: ${shown.join(', ')}${more > 0 ? ` и ещё ${more} более ранних` : ''}. Полный текст: ${folder}/prompts/<id>.md.`
+  return `Сообщения пользователя без сути в журнале: ${shown.join(', ')}${more > 0 ? ` и ещё ${more} более ранних` : ''}. Полный текст: intent_update с id и read_prompt=true.`
 }
 const PRESSURE_NOTE = 'Контекст скоро будет сжат. Если важное (решения, запреты, статусы, блокеры) ещё не в журнале, допиши его сейчас через intent_update/intent_note.'
 const SUMMARY_NOTE = (journal) => `Журнал намерений пользователя за сессию (источник правды о его запросах, решениях и статусах). Учти его в сводке, шаблон сводки не меняй:\n<intent-journal>\n${journal}</intent-journal>`
@@ -23,9 +23,10 @@ const DIRECT = Object.freeze({ codemode: false })
 
 // Изменчивые подсказки идут в конец истории, а не в system: так не сбрасывается кэш префикса у провайдера.
 const appendNote = (event, note) => event.messages.push({ role: 'system', content: [{ type: 'text', text: note }] })
+const rewindKey = (sessionID, messageID) => `rewind/${encodeURIComponent(sessionID)}/${encodeURIComponent(messageID)}`
 
 /**
- * Плагин не вмешивается в работу сессии: штатная компакция остаётся штатной,
+ * Плагин запрашивает штатную компакцию по порогу, не подменяя её результат;
  * ошибки плагина пишутся в plugin.log и никогда не прерывают запрос.
  * Ошибки инструментов возвращаются модели: это её ввод, она может исправиться.
  */
@@ -55,30 +56,64 @@ export async function setup(ctx, root = ROOT, registerInterface) {
     return childSessions.get(sessionID)
   }
 
+  function requestCompaction(sessionID, usage) {
+    compactRequested.set(sessionID, usage.messageID)
+    ctx.session.compact({ sessionID }).then(
+      () => log(`compact requested session=${sessionID} context=${usage.tokens}`),
+      (error) => log(`ERROR compact session=${sessionID}: ${error?.stack ?? error}`),
+    )
+  }
+
   // До регистрации хуков: очистка не пересекается с записью в журнал.
   await safely('prune', '-', async () => {
     const removed = await pruneOld(root)
     if (removed.length > 0) await log(`pruned ${removed.join(' ')}`)
   })
 
-  // Если тип сессии не удалось узнать, сообщение всё равно записывается: потерять просьбу пользователя хуже.
+  // Не пишем в журнал, пока не установлено, что сессия не принадлежит подагенту.
   registrations.push(await ctx.session.hook('prompt', (event) => safely('prompt', event.sessionID, async () => {
     if (event.prompt.text.trim() === '') return
-    if ((await safely('prompt', event.sessionID, () => isChild(event.sessionID))) === true) return
-    const session = await safely('rewind-boundary', event.sessionID, () => ctx.session.get({ sessionID: event.sessionID }))
-    await journal.recordPrompt(event.sessionID, event.messageID, event.prompt.text, session?.revert?.messageID)
+    if ((await safely('prompt', event.sessionID, () => isChild(event.sessionID))) !== false) return
+    const session = await ctx.session.get({ sessionID: event.sessionID })
+    if (session.revert?.messageID !== undefined) {
+      await ctx.storage.set(rewindKey(event.sessionID, event.messageID), session.revert.messageID)
+    }
   })))
 
-  // У подагентов журнала нет, render вернёт пустую строку.
-  registrations.push(await ctx.session.hook('compaction', (event) => safely('compaction', event.sessionID, async () => {
-    const full = render(await journal.load(event.sessionID), 'full')
-    if (full !== '') event.system.push({ type: 'text', text: SUMMARY_NOTE(full) })
-  })))
+  registrations.push(await ctx.session.hook('compaction', async (event) => {
+    const child = await safely('compaction', event.sessionID, () => isChild(event.sessionID))
+    if (child !== false) {
+      for (const name of TOOL_NAMES) delete event.tools[name]
+      return
+    }
+    await safely('compaction', event.sessionID, async () => {
+      // Admission мог сохранить reverts и упасть на удалении metadata. Перед сводкой
+      // применяем подтверждённый rewind заново; при ошибке не выдаём устаревший журнал.
+      const messages = await ctx.session.context({ sessionID: event.sessionID })
+      const visible = messages.filter((message) => message.type === 'user').map((message) => message.id)
+      let state = await journal.load(event.sessionID)
+      const compacted = latestCompaction(messages) !== undefined
+      if (revertedIDs(state, visible, compacted).length > 0) {
+        await journal.markReverted(event.sessionID, visible, compacted)
+        state = await journal.load(event.sessionID)
+      }
+      const full = render(state, 'full')
+      if (full === '') return
+      event.system.push({ type: 'text', text: SUMMARY_NOTE(full) })
+      await safely('usage', event.sessionID, () => journal.noteServed(event.sessionID, { summarized: true }))
+    })
+  }))
 
   registrations.push(await ctx.session.hook('context', async (event) => {
     const child = await safely('context', event.sessionID, () => isChild(event.sessionID))
     if (child !== false) {
       for (const name of TOOL_NAMES) delete event.tools[name]
+      if (child === true) await safely('child-compaction', event.sessionID, async () => {
+        const usage = reportedContext(await ctx.session.context({ sessionID: event.sessionID }))
+        if (usage !== undefined && usage.tokens >= POLICY.compactAt && compactRequested.get(event.sessionID) !== usage.messageID) {
+          requestCompaction(event.sessionID, usage)
+        }
+      })
       return
     }
     await safely('context', event.sessionID, () => enrich(event))
@@ -86,10 +121,35 @@ export async function setup(ctx, root = ROOT, registerInterface) {
 
   async function enrich(event) {
     const folder = sessionDir(root, event.sessionID)
-    event.system.push({ type: 'text', text: GUIDANCE(folder) })
 
+    answering.delete(event.sessionID)
     const messages = await safely('context', event.sessionID, () => ctx.session.context({ sessionID: event.sessionID }))
-    let state = await safely('context', event.sessionID, () => journal.load(event.sessionID))
+    const admissionReady = messages === undefined ? false : await safely('admission', event.sessionID, async () => {
+      const requestUsers = event.messages.filter((message) => message.role === 'user')
+      if (requestUsers.some((message) => typeof message.id !== 'string')) await log(`WARN context session=${event.sessionID}: user message without ID not journaled`)
+      const requestIDs = new Set(requestUsers.filter((message) => typeof message.id === 'string').map((message) => message.id))
+      const admitted = messages.filter((message) => message.type === 'user' && typeof message.id === 'string' && requestIDs.has(message.id))
+      const state = await journal.load(event.sessionID)
+      const delivered = new Set(state.entries.map((entry) => entry.messageID).filter((id) => id !== undefined))
+      for (const message of admitted) {
+        if (typeof message.text !== 'string' || message.text.trim() === '') continue
+        const key = rewindKey(event.sessionID, message.id)
+        const boundary = await ctx.storage.get(key)
+        if (boundary !== undefined && typeof boundary !== 'string') throw new Error('Invalid staged rewind boundary')
+        if (!delivered.has(message.id)) {
+          await journal.recordPrompt(event.sessionID, message.id, message.text, boundary)
+          delivered.add(message.id)
+        }
+        if (boundary !== undefined) await ctx.storage.remove(key)
+      }
+      const lastRequestID = requestUsers.at(-1)?.id
+      const last = typeof lastRequestID === 'string' ? admitted.find((message) => message.id === lastRequestID && typeof message.text === 'string' && message.text.trim() !== '') : undefined
+      if (last !== undefined) answering.set(event.sessionID, last.id)
+      return true
+    })
+    const viewReady = admissionReady && await safely('view', event.sessionID, async () => { await journal.syncView(event.sessionID); return true })
+    if (viewReady) event.system.push({ type: 'text', text: GUIDANCE(folder) })
+    let state = viewReady ? await safely('context', event.sessionID, () => journal.load(event.sessionID)) : undefined
 
     if (messages !== undefined && state !== undefined) {
       const visible = messages.filter((message) => message.type === 'user').map((message) => message.id)
@@ -102,14 +162,13 @@ export async function setup(ctx, root = ROOT, registerInterface) {
 
     if (state !== undefined) {
       const pending = pendingIDs(state)
-      if (pending.length > 0) appendNote(event, PENDING_NOTE(pending, folder))
+      if (pending.length > 0) appendNote(event, PENDING_NOTE(pending))
       const corrections = userCorrections(state)
       if (corrections.length > 0) appendNote(event, USER_EDITS_NOTE(corrections))
     }
 
     if (messages === undefined) return
-    const lastUser = messages.findLast((message) => message.type === 'user')
-    if (lastUser !== undefined) answering.set(event.sessionID, lastUser.id)
+    let restoredHappened = false
     if (state !== undefined) await safely('restore', event.sessionID, async () => {
       const compaction = latestCompaction(messages)
       if (compaction === undefined || restored.get(event.sessionID) === compaction.id) return
@@ -118,22 +177,25 @@ export async function setup(ctx, root = ROOT, registerInterface) {
       if ((await ctx.storage.get(storageKey)) === compaction.id) return
       await ctx.storage.set(storageKey, compaction.id)
       const brief = render(state, 'brief')
-      if (brief !== '') appendNote(event, RESTORE_NOTE(brief, folder))
+      if (brief !== '') {
+        appendNote(event, RESTORE_NOTE(brief, folder))
+        restoredHappened = true
+      }
       await log(`restored session=${event.sessionID} compaction=${compaction.id} reason=${compaction.reason}`)
     })
 
     // Напоминание и сжатие в одном шаге: compact срабатывает на границе шага,
     // поэтому записи модели в этом шаге попадают в журнал до сводки.
     const usage = reportedContext(messages)
-    if (usage === undefined || usage.tokens < POLICY.compactAt) return
-    if (compactRequested.get(event.sessionID) === usage.messageID) return
-    compactRequested.set(event.sessionID, usage.messageID)
-    appendNote(event, PRESSURE_NOTE)
-    // Не ждём: постановка в очередь не должна задерживать текущий запрос.
-    ctx.session.compact({ sessionID: event.sessionID }).then(
-      () => log(`compact requested session=${event.sessionID} context=${usage.tokens}`),
-      (error) => log(`ERROR compact session=${event.sessionID}: ${error?.stack ?? error}`),
-    )
+    let pressuredHappened = false
+    if (usage !== undefined && usage.tokens >= POLICY.compactAt && compactRequested.get(event.sessionID) !== usage.messageID) {
+      appendNote(event, PRESSURE_NOTE)
+      pressuredHappened = true
+      // Не ждём: постановка в очередь не должна задерживать текущий запрос.
+      requestCompaction(event.sessionID, usage)
+    }
+
+    if (state !== undefined) await safely('usage', event.sessionID, () => journal.noteServed(event.sessionID, { restored: restoredHappened, pressured: pressuredHappened }))
   }
 
   registrations.push(await ctx.tool.transform((editor) => {
@@ -148,6 +210,7 @@ export async function setup(ctx, root = ROOT, registerInterface) {
         additionalProperties: false,
       },
       execute: async (input, context) => {
+        if (await isChild(context.sessionID)) throw new Error('Журнал намерений недоступен подагентам')
         if (input.kind === 'intent') return { content: `Добавлено: ${await journal.addIntent(context.sessionID, input)}` }
         await journal.addNote(context.sessionID, input.kind, input.text)
         return { content: 'Добавлено.' }
@@ -163,6 +226,7 @@ export async function setup(ctx, root = ROOT, registerInterface) {
         additionalProperties: false,
       },
       execute: async ({ id, read_prompt: readPrompt, ...change }, context) => {
+        if (await isChild(context.sessionID)) throw new Error('Журнал намерений недоступен подагентам')
         const changed = Object.values(change).some((value) => value !== undefined)
         if (changed && id === undefined && !answering.has(context.sessionID)) throw new Error('Не удалось определить сообщение, на которое ты отвечаешь; укажи id')
         const target = changed ? await journal.update(context.sessionID, id === undefined ? { messageID: answering.get(context.sessionID) } : { id }, change) : id

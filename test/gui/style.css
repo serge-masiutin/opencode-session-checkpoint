@@ -1,0 +1,6 @@
+/* Только тестовые host-токены; в GUI-бандл плагина не входят. */
+:root { --v2-text-text-base: #202124; --v2-text-text-muted: #656970; --v2-background-bg-base: #fff; --v2-background-bg-layer-01: #f5f6f7; --v2-border-border-base: #d2d6da; --v2-border-border-focus: #2463b5; --v2-overlay-simple-overlay-hover: #e8eef6; --v2-state-fg-danger: #b3261e; --v2-state-fg-warning: #805800; --v2-state-fg-success: #22863a; color-scheme: light; }
+:root[data-theme=dark] { --v2-text-text-base: #eee; --v2-text-text-muted: #aaa; --v2-background-bg-base: #202327; --v2-background-bg-layer-01: #292d32; --v2-border-border-base: #535b65; --v2-border-border-focus: #8bb8ff; --v2-overlay-simple-overlay-hover: #313a48; --v2-state-fg-danger: #ff9087; --v2-state-fg-warning: #e6bf6b; --v2-state-fg-success: #56c174; color-scheme: dark; }
+body { margin: 0; padding: 20px; background: var(--v2-background-bg-layer-01); color: var(--v2-text-text-base); font: 13px system-ui; }
+.fixture-panel { width: min(800px, 100%); height: 560px; margin: 20px auto; border: 1px solid var(--v2-border-border-base); }
+button, input { padding: 7px; font: inherit; } input { width: 100%; min-width: 0; }

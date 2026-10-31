@@ -82,3 +82,33 @@ test('уточнения переживают повторное чтение и
   assert.equal(userCorrections(restored)[0].clarification, 'Не повторять отправку.')
   assert.match(render(restored, 'brief'), /Не повторять отправку/)
 })
+
+test('dismiss удаляет заметку по id, записи и промпты не трогает; неизвестный id — ошибка', async (t) => {
+  const { api, journal } = await fixture(t)
+  await journal.addNote('ses_test', 'blocker', 'Блокер уровня сессии')
+  const before = await api.list({ sessionID: 'ses_test', query: '', filter: 'all' })
+  const [note] = before.notes
+  assert.equal(note.kind, 'blocker')
+  assert.notEqual(note.id, undefined)
+  const after = await api.dismiss({ sessionID: 'ses_test', id: note.id })
+  assert.equal(after.notes.length, 0)
+  const state = await journal.load('ses_test')
+  assert.equal(state.entries.length, 1)
+  assert.match(await journal.readPrompt('ses_test', 'i1'), /Исходный промпт/)
+  await assert.rejects(api.dismiss({ sessionID: 'ses_test', id: note.id }), /not found/i)
+})
+
+test('stats показывает активность агента и состояние памяти', async (t) => {
+  const { api, journal } = await fixture(t)
+  await journal.addNote('ses_test', 'postponed', 'Отложено')
+  await journal.noteServed('ses_test', { restored: true })
+  const stats = await api.stats({ sessionID: 'ses_test' })
+  assert.equal(stats.usage.writes >= 3, true)
+  assert.equal(stats.usage.served, 1)
+  assert.equal(stats.usage.restores, 1)
+  assert.equal(stats.usage.userEdits, 0)
+  assert.notEqual(stats.usage.lastWriteAt, null)
+  assert.notEqual(stats.usage.lastServedAt, null)
+  assert.deepEqual(stats.entries, { open: 1, all: 1, decisions: 1, pending: 0, reverted: 0 })
+  assert.equal(stats.notes, 1)
+})

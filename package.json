@@ -10,7 +10,8 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "check": "tsc --noEmit",
-    "build": "vite build"
+    "build": "vite build",
+    "test:gui": "vite --config test/gui/vite.config.ts"
   },
   "dependencies": { "@opencode/plugin": "2.2.0" },
   "devDependencies": {

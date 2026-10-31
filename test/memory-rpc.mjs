@@ -33,7 +33,7 @@ const directory = join(root, 'project')
 const elsewhere = join(root, 'other')
 for (const path of [directory, elsewhere, join(root, 'config/opencode')]) await mkdir(path, { recursive: true })
 await writeFile(join(root, 'config/opencode/opencode.json'), JSON.stringify({
-  model: 'fixture/fixture', plugins: [resolve(import.meta.dirname, '..')], update: 'disable', compaction: { auto: false },
+  model: 'fixture/fixture', plugins: [resolve(process.env.OPENCODE_CHECKPOINT_PLUGIN ?? resolve(import.meta.dirname, '..'))], update: 'disable', compaction: { auto: false },
   providers: { fixture: {
     package: '@opencode/ai/providers/openai-compatible',
     settings: { baseURL: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'local-test-not-a-secret' },
